@@ -22,7 +22,7 @@ info:
     ## Running locally
     ```bash
     docker compose up
-    # API available at http://localhost:5001
+    # API available at http://localhost:5000
     ```
   contact:
     name: Keerthanaa Narayanan
@@ -30,7 +30,7 @@ info:
     email: keerthanaa.narayanasamy@gmail.com
   version: 1.0.0
 servers:
-- url: http://localhost:5001
+- url: http://localhost:5000
   description: Local development (Docker Compose)
 tags:
 - name: Ingestion
