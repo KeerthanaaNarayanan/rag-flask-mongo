@@ -1,0 +1,736 @@
+openapi: 3.0.3
+info:
+  title: RAG API Service
+  description: |
+    A Retrieval-Augmented Generation (RAG) API built with Flask and MongoDB.
+
+    ## Overview
+    This service allows you to **ingest** documents (PDF or plain text) and **query** them
+    using natural language. Under the hood:
+    - Documents are split into overlapping chunks and embedded using `sentence-transformers`
+    - Embeddings are stored as float arrays in MongoDB alongside the original text and metadata
+    - At query time, the question is embedded using the same model, and cosine similarity
+      (via numpy dot product on normalised vectors) is used to retrieve the top-k most
+      relevant chunks
+    - Retrieved chunks are passed as context to an LLM (OpenAI or Ollama) to generate
+      a grounded, cited answer
+
+    ## Authentication
+    Set your `OPENAI_API_KEY` environment variable. All endpoints are currently unauthenticated
+    (JWT auth is planned — see roadmap).
+
+    ## Running locally
+    ```bash
+    docker compose up
+    # API available at http://localhost:5001
+    ```
+  contact:
+    name: Keerthanaa Narayanan
+    url: https://github.com/keerthanaanarayanan
+    email: keerthanaa.narayanasamy@gmail.com
+  version: 1.0.0
+servers:
+- url: http://localhost:5001
+  description: Local development (Docker Compose)
+tags:
+- name: Ingestion
+  description: Upload and index documents into MongoDB
+- name: Query
+  description: Ask questions against ingested documents
+- name: Management
+  description: Inspect ingested collections and service health
+paths:
+  /ingest:
+    post:
+      tags:
+      - Ingestion
+      summary: Ingest a document
+      description: |
+        Accepts either a **PDF file upload** (`multipart/form-data`) or **raw text**
+        (`application/json`). The service will:
+        1. Extract text (PDF) or use the provided text directly
+        2. Split into overlapping chunks (`CHUNK_SIZE` tokens, `CHUNK_OVERLAP` overlap)
+        3. Embed all chunks in a single batch using `sentence-transformers`
+        4. Store each chunk as a MongoDB document with its embedding vector
+
+        Re-ingesting the same `source` name will add duplicate chunks. Use
+        `DELETE /collections/{source}` to clear a source before re-ingesting.
+      operationId: ingest_document
+      requestBody:
+        content:
+          multipart/form-data:
+            schema:
+              $ref: "#/components/schemas/ingest_body"
+            encoding:
+              file:
+                contentType: application/pdf
+                style: form
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ingest_body_1"
+        required: true
+      responses:
+        "201":
+          description: Document successfully ingested
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/IngestResponse"
+              example:
+                chunk_count: 42
+                source: annual_report_2024.pdf
+                collection_name: annual_reports
+                ingested_at: 2026-05-23T10:30:00Z
+        "400":
+          description: "Request validation failed (missing fields, wrong types)"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              example:
+                error: validation_error
+                message: Field 'question' is required and cannot be empty.
+        "422":
+          description: "File was received but could not be processed (corrupt PDF,\
+            \ empty file, unsupported format)"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              example:
+                error: parse_error
+                message: "Could not extract text from the uploaded file. Ensure it\
+                  \ is a valid, non-encrypted PDF."
+        "500":
+          description: Unexpected server error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              example:
+                error: internal_error
+                message: An unexpected error occurred. Please try again or check service
+                  logs.
+      x-openapi-router-controller: swagger_server.controllers.ingestion_controller
+  /query:
+    post:
+      tags:
+      - Query
+      summary: Query ingested documents
+      description: |
+        Ask a natural language question. The service will:
+        1. Embed the question using the same model used during ingestion
+        2. Fetch all embeddings from MongoDB and compute cosine similarity
+           (dot product on normalised vectors via numpy)
+        3. Retrieve the top-k most similar chunks
+        4. Build a prompt with the question + retrieved context
+        5. Call the configured LLM (OpenAI `gpt-4o-mini` or local Ollama)
+        6. Return the answer with source citations
+
+        Each source in the response includes a `score` (0–1) indicating
+        how semantically similar that chunk was to the question.
+      operationId: query_documents
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/QueryRequest"
+            examples:
+              simple:
+                summary: Basic question
+                value:
+                  question: What is the revenue growth for Q3 2024?
+              with_filter:
+                summary: Question scoped to a specific source
+                value:
+                  question: What are the key risks mentioned?
+                  top_k: 6
+                  source_filter: annual_report_2024.pdf
+        required: true
+      responses:
+        "200":
+          description: Answer generated with source citations
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/QueryResponse"
+              example:
+                answer: "Revenue grew by 18% in Q3 2024, driven primarily by..."
+                sources:
+                - text: "Q3 revenue reached $4.2B, an 18% increase year-over-year..."
+                  source: annual_report_2024.pdf
+                  page: 12
+                  chunk_index: 47
+                  score: 0.91
+                - text: Growth was primarily driven by cloud services and...
+                  source: annual_report_2024.pdf
+                  page: 13
+                  chunk_index: 48
+                  score: 0.84
+                model_used: gpt-4o-mini
+                latency_ms: 1243
+        "400":
+          description: "Request validation failed (missing fields, wrong types)"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              example:
+                error: validation_error
+                message: Field 'question' is required and cannot be empty.
+        "404":
+          description: No documents have been ingested yet
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              example:
+                error: no_documents
+                message: No documents found in the collection. Please ingest documents
+                  first.
+        "500":
+          description: Unexpected server error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              example:
+                error: internal_error
+                message: An unexpected error occurred. Please try again or check service
+                  logs.
+      x-openapi-router-controller: swagger_server.controllers.query_controller
+  /collections:
+    get:
+      tags:
+      - Management
+      summary: List all ingested sources
+      description: |
+        Returns all distinct document sources currently stored in MongoDB,
+        along with chunk counts and ingestion timestamps. Useful for confirming
+        what has been indexed before querying.
+      operationId: list_collections
+      responses:
+        "200":
+          description: List of ingested sources
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CollectionsResponse"
+              example:
+                total_chunks: 187
+                sources:
+                - source: annual_report_2024.pdf
+                  chunk_count: 42
+                  ingested_at: 2026-05-23T10:30:00Z
+                - source: mongodb_docs
+                  chunk_count: 145
+                  ingested_at: 2026-05-22T08:15:00Z
+        "500":
+          description: Unexpected server error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              example:
+                error: internal_error
+                message: An unexpected error occurred. Please try again or check service
+                  logs.
+      x-openapi-router-controller: swagger_server.controllers.management_controller
+  /collections/{source}:
+    delete:
+      tags:
+      - Management
+      summary: Delete all chunks for a source
+      description: |
+        Removes all MongoDB documents matching the given `source` identifier.
+        Use this before re-ingesting an updated version of a document to avoid
+        duplicate chunks polluting retrieval results.
+      operationId: delete_source
+      parameters:
+      - name: source
+        in: path
+        description: The source identifier to delete (e.g. filename or slug)
+        required: true
+        style: simple
+        explode: false
+        schema:
+          type: string
+        example: annual_report_2024.pdf
+      responses:
+        "200":
+          description: Source deleted successfully
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/inline_response_200"
+        "404":
+          description: Source not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              example:
+                error: source_not_found
+                message: "No chunks found for source: annual_report_2024.pdf"
+        "500":
+          description: Unexpected server error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              example:
+                error: internal_error
+                message: An unexpected error occurred. Please try again or check service
+                  logs.
+      x-openapi-router-controller: swagger_server.controllers.management_controller
+  /health:
+    get:
+      tags:
+      - Management
+      summary: Service health check
+      description: |
+        Returns the operational status of all service dependencies:
+        - **embedding_model**: whether `sentence-transformers` is loaded and ready
+        - **mongodb**: whether the PyMongo connection is live (runs a `ping` command)
+        - **llm**: whether the configured LLM (OpenAI or Ollama) is reachable
+      operationId: health_check
+      responses:
+        "200":
+          description: All systems healthy
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HealthResponse"
+              example:
+                status: healthy
+                version: 1.0.0
+                uptime_seconds: 3621
+                dependencies:
+                  embedding_model:
+                    status: ok
+                    model: all-MiniLM-L6-v2
+                    dimensions: 384
+                  mongodb:
+                    status: ok
+                    ping_ms: 2
+                  llm:
+                    status: ok
+                    provider: openai
+                    model: gpt-4o-mini
+        "503":
+          description: One or more dependencies are unhealthy
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HealthResponse"
+              example:
+                status: degraded
+                dependencies:
+                  embedding_model:
+                    status: ok
+                    model: all-MiniLM-L6-v2
+                  mongodb:
+                    status: error
+                    error: Connection refused at mongo:27017
+                  llm:
+                    status: ok
+      x-openapi-router-controller: swagger_server.controllers.management_controller
+components:
+  schemas:
+    IngestResponse:
+      required:
+      - chunk_count
+      - collection_name
+      - ingested_at
+      - source
+      type: object
+      properties:
+        chunk_count:
+          type: integer
+          description: Number of chunks created and stored in MongoDB
+          example: 42
+        source:
+          type: string
+          description: Identifier for the ingested document
+          example: annual_report_2024.pdf
+        collection_name:
+          type: string
+          description: Logical collection the document was stored in
+          example: annual_reports
+        ingested_at:
+          type: string
+          description: UTC timestamp of ingestion
+          format: date-time
+          example: 2026-05-23T10:30:00Z
+      example:
+        chunk_count: 42
+        ingested_at: 2026-05-23T10:30:00Z
+        source: annual_report_2024.pdf
+        collection_name: annual_reports
+    QueryRequest:
+      required:
+      - question
+      type: object
+      properties:
+        question:
+          maxLength: 1000
+          minLength: 3
+          type: string
+          description: Natural language question to answer
+          example: What is the revenue growth for Q3 2024?
+        top_k:
+          maximum: 20
+          minimum: 1
+          type: integer
+          description: Number of chunks to retrieve for context (overrides server
+            default)
+          example: 4
+          default: 4
+        source_filter:
+          type: string
+          description: Restrict retrieval to chunks from a specific source document
+          example: annual_report_2024.pdf
+        collection_name:
+          type: string
+          description: Query within a specific logical collection
+          example: annual_reports
+          default: default
+    QueryResponse:
+      required:
+      - answer
+      - sources
+      type: object
+      properties:
+        answer:
+          type: string
+          description: LLM-generated answer grounded in retrieved context
+          example: "Revenue grew by 18% in Q3 2024, driven primarily by cloud services..."
+        sources:
+          type: array
+          description: Chunks retrieved from MongoDB used to generate the answer
+          items:
+            $ref: "#/components/schemas/SourceChunk"
+        model_used:
+          type: string
+          description: LLM model that generated the answer
+          example: gpt-4o-mini
+        latency_ms:
+          type: integer
+          description: Total request processing time in milliseconds
+          example: 1243
+      example:
+        answer: "Revenue grew by 18% in Q3 2024, driven primarily by cloud services..."
+        sources:
+        - chunk_index: 47
+          score: 0.91
+          text: "Q3 revenue reached $4.2B, an 18% increase year-over-year..."
+          source: annual_report_2024.pdf
+          page: 12
+        - chunk_index: 47
+          score: 0.91
+          text: "Q3 revenue reached $4.2B, an 18% increase year-over-year..."
+          source: annual_report_2024.pdf
+          page: 12
+        model_used: gpt-4o-mini
+        latency_ms: 1243
+    SourceChunk:
+      required:
+      - score
+      - source
+      - text
+      type: object
+      properties:
+        text:
+          type: string
+          description: The raw chunk text used as context
+          example: "Q3 revenue reached $4.2B, an 18% increase year-over-year..."
+        source:
+          type: string
+          description: Source document identifier
+          example: annual_report_2024.pdf
+        page:
+          type: integer
+          description: Page number (PDF sources only)
+          nullable: true
+          example: 12
+        chunk_index:
+          type: integer
+          description: Sequential chunk index within the source document
+          example: 47
+        score:
+          maximum: 1
+          minimum: 0
+          type: number
+          description: Cosine similarity score between this chunk and the query (0–1)
+          format: float
+          example: 0.91
+      example:
+        chunk_index: 47
+        score: 0.91
+        text: "Q3 revenue reached $4.2B, an 18% increase year-over-year..."
+        source: annual_report_2024.pdf
+        page: 12
+    CollectionsResponse:
+      required:
+      - sources
+      - total_chunks
+      type: object
+      properties:
+        total_chunks:
+          type: integer
+          description: Total number of chunks stored across all sources
+          example: 187
+        sources:
+          type: array
+          items:
+            $ref: "#/components/schemas/CollectionsResponse_sources"
+      example:
+        sources:
+        - chunk_count: 42
+          ingested_at: 2026-05-23T10:30:00Z
+          source: annual_report_2024.pdf
+        - chunk_count: 42
+          ingested_at: 2026-05-23T10:30:00Z
+          source: annual_report_2024.pdf
+        total_chunks: 187
+    HealthResponse:
+      required:
+      - dependencies
+      - status
+      type: object
+      properties:
+        status:
+          type: string
+          example: healthy
+          enum:
+          - healthy
+          - degraded
+          - unhealthy
+        version:
+          type: string
+          example: 1.0.0
+        uptime_seconds:
+          type: integer
+          example: 3621
+        dependencies:
+          $ref: "#/components/schemas/HealthResponse_dependencies"
+      example:
+        uptime_seconds: 3621
+        version: 1.0.0
+        status: healthy
+        dependencies:
+          embedding_model:
+            model: all-MiniLM-L6-v2
+            error: error
+            status: ok
+            dimensions: 384
+          llm:
+            provider: openai
+            model: gpt-4o-mini
+            error: error
+            status: ok
+          mongodb:
+            ping_ms: 2
+            error: error
+            status: ok
+    ErrorResponse:
+      required:
+      - error
+      - message
+      type: object
+      properties:
+        error:
+          type: string
+          description: Machine-readable error code
+          example: validation_error
+        message:
+          type: string
+          description: Human-readable error description
+          example: Field 'question' is required and cannot be empty.
+        details:
+          type: object
+          additionalProperties: true
+          description: Optional additional context (field-level validation errors
+            etc.)
+    ingest_body:
+      required:
+      - file
+      type: object
+      properties:
+        file:
+          type: string
+          description: PDF file to ingest
+          format: binary
+        collection_name:
+          type: string
+          description: Logical collection name to group documents
+          example: annual_reports
+          default: default
+    ingest_body_1:
+      required:
+      - source
+      - text
+      type: object
+      properties:
+        text:
+          type: string
+          description: Raw text content to ingest
+          example: MongoDB is a document-oriented NoSQL database...
+        source:
+          type: string
+          description: Identifier for this document (used in citations)
+          example: mongodb_docs
+        collection_name:
+          type: string
+          example: tech_docs
+          default: default
+    inline_response_200:
+      type: object
+      properties:
+        deleted_count:
+          type: integer
+          example: 42
+        source:
+          type: string
+          example: annual_report_2024.pdf
+      example:
+        source: annual_report_2024.pdf
+        deleted_count: 42
+    CollectionsResponse_sources:
+      required:
+      - chunk_count
+      - ingested_at
+      - source
+      type: object
+      properties:
+        source:
+          type: string
+          example: annual_report_2024.pdf
+        chunk_count:
+          type: integer
+          example: 42
+        ingested_at:
+          type: string
+          format: date-time
+          example: 2026-05-23T10:30:00Z
+      example:
+        chunk_count: 42
+        ingested_at: 2026-05-23T10:30:00Z
+        source: annual_report_2024.pdf
+    HealthResponse_dependencies_embedding_model:
+      type: object
+      properties:
+        status:
+          type: string
+          enum:
+          - ok
+          - error
+        model:
+          type: string
+          example: all-MiniLM-L6-v2
+        dimensions:
+          type: integer
+          example: 384
+        error:
+          type: string
+      example:
+        model: all-MiniLM-L6-v2
+        error: error
+        status: ok
+        dimensions: 384
+    HealthResponse_dependencies_mongodb:
+      type: object
+      properties:
+        status:
+          type: string
+          enum:
+          - ok
+          - error
+        ping_ms:
+          type: integer
+          example: 2
+        error:
+          type: string
+      example:
+        ping_ms: 2
+        error: error
+        status: ok
+    HealthResponse_dependencies_llm:
+      type: object
+      properties:
+        status:
+          type: string
+          enum:
+          - ok
+          - error
+        provider:
+          type: string
+          enum:
+          - openai
+          - ollama
+        model:
+          type: string
+          example: gpt-4o-mini
+        error:
+          type: string
+      example:
+        provider: openai
+        model: gpt-4o-mini
+        error: error
+        status: ok
+    HealthResponse_dependencies:
+      type: object
+      properties:
+        embedding_model:
+          $ref: "#/components/schemas/HealthResponse_dependencies_embedding_model"
+        mongodb:
+          $ref: "#/components/schemas/HealthResponse_dependencies_mongodb"
+        llm:
+          $ref: "#/components/schemas/HealthResponse_dependencies_llm"
+      example:
+        embedding_model:
+          model: all-MiniLM-L6-v2
+          error: error
+          status: ok
+          dimensions: 384
+        llm:
+          provider: openai
+          model: gpt-4o-mini
+          error: error
+          status: ok
+        mongodb:
+          ping_ms: 2
+          error: error
+          status: ok
+  responses:
+    BadRequest:
+      description: "Request validation failed (missing fields, wrong types)"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+          example:
+            error: validation_error
+            message: Field 'question' is required and cannot be empty.
+    UnprocessableEntity:
+      description: "File was received but could not be processed (corrupt PDF, empty\
+        \ file, unsupported format)"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+          example:
+            error: parse_error
+            message: "Could not extract text from the uploaded file. Ensure it is\
+              \ a valid, non-encrypted PDF."
+    InternalError:
+      description: Unexpected server error
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+          example:
+            error: internal_error
+            message: An unexpected error occurred. Please try again or check service
+              logs.
+
