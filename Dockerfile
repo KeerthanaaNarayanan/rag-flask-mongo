@@ -40,6 +40,6 @@ COPY --from=builder /opt/sentence-transformers /opt/sentence-transformers
 # Copy app only in runtime image.
 COPY swagger_server /usr/src/app/swagger_server
 
-EXPOSE 8080
+EXPOSE 5000
 
 ENTRYPOINT ["python", "-m", "swagger_server"]

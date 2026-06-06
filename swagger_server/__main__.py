@@ -11,10 +11,15 @@ class CustomJSONProvider(DefaultJSONProvider):
         return encoder.JSONEncoder().default(o)
 
 
-def main():
+def create_app() -> connexion.App:
     app = connexion.App(__name__, specification_dir='./swagger/')
     app.app.json = CustomJSONProvider(app.app)
     app.add_api('swagger.yaml', arguments={'title': 'RAG API Service'}, pythonic_params=True)
+    return app
+
+
+def main():
+    app = create_app()
     app.run(port=5000)
 
 
