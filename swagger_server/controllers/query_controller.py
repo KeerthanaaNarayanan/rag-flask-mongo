@@ -1,9 +1,8 @@
 import connexion
 import six
 import json
+import logging
 import time
-
-from flask import Response, stream_with_context
 
 from swagger_server.models.error_response import ErrorResponse  # noqa: E501
 from swagger_server.models.query_request import QueryRequest  # noqa: E501
@@ -11,6 +10,9 @@ from swagger_server.models.query_response import QueryResponse  # noqa: E501
 from swagger_server.models.source_chunk import SourceChunk  # noqa: E501
 from swagger_server import util
 from swagger_server.services import embedder, llm, vector_store
+
+
+logger = logging.getLogger(__name__)
 
 
 def _to_bool(value) -> bool:
@@ -39,6 +41,7 @@ def query_documents(body):  # noqa: E501
     """
     started = time.time()
     try:
+        logger.info("Received query request with body: %s", body)
         if not connexion.request.is_json:
             return ErrorResponse(error="validation_error", message="Expected application/json body."), 400
 
@@ -54,6 +57,14 @@ def query_documents(body):  # noqa: E501
         source_filter = (body.source_filter or "").strip()
         collection = (body.collection_name or "default").strip() or "default"
 
+        logger.info(
+            "query request question=%r top_k=%s source_filter=%r collection=%r",
+            question,
+            top_k,
+            source_filter,
+            collection,
+        )
+
         q_embedding = embedder.embed([question])[0]
         retrieved = vector_store.get_store(collection).query(q_embedding, top_k)
 
@@ -67,41 +78,15 @@ def query_documents(body):  # noqa: E501
 
         if is_streaming:
             stream_data = llm.stream_answer_with_context(question=question, retrieved_chunks=retrieved)
+            answer = "".join(stream_data["tokens"])
+            sources = [_chunk_to_model(item) for item in stream_data["sources"]]
+            latency_ms = int((time.time() - started) * 1000)
 
-            @stream_with_context
-            def event_stream():
-                yield "event: sources\n"
-                yield f"data: {json.dumps(stream_data['sources'])}\n\n"
-
-                answer_parts = []
-                for token in stream_data["tokens"]:
-                    answer_parts.append(token)
-                    yield "event: token\n"
-                    yield f"data: {json.dumps({'text': token})}\n\n"
-
-                latency_ms = int((time.time() - started) * 1000)
-                yield "event: done\n"
-                yield (
-                    "data: "
-                    + json.dumps(
-                        {
-                            "answer": "".join(answer_parts),
-                            "model_used": stream_data["model_used"],
-                            "provider_used": stream_data["provider_used"],
-                            "latency_ms": latency_ms,
-                        }
-                    )
-                    + "\n\n"
-                )
-
-            return Response(
-                event_stream(),
-                mimetype="text/event-stream",
-                headers={
-                    "Cache-Control": "no-cache",
-                    "Connection": "keep-alive",
-                    "X-Accel-Buffering": "no",
-                },
+            return QueryResponse(
+                answer=answer,
+                sources=sources,
+                model_used=stream_data["model_used"],
+                latency_ms=latency_ms,
             )
 
         llm_result = llm.generate_answer(question=question, retrieved_chunks=retrieved)

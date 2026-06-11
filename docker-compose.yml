@@ -13,6 +13,7 @@ services:
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
       LLM_PROVIDER: ${LLM_PROVIDER:-openai}
       OLLAMA_URL: ${OLLAMA_URL:-http://host.docker.internal:11434}
+      DEBUG_MODE: ${DEBUG_MODE:-false}
     depends_on:
       - chromadb
 
